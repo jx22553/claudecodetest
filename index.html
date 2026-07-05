@@ -254,6 +254,8 @@
 
   function handleMove(i) {
     if (board[i] || gameOver) return;
+    // Ignore clicks while the computer is due to move (during its think delay).
+    if (vsComputer && current === 'O') return;
     board[i] = current;
     processResult();
     if (!gameOver && vsComputer && current === 'O') {
