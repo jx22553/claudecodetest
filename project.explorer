@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "root": ".",
+  "descriptions": {
+    "index.html": "The entire Tic-Tac-Toe game: markup, CSS, and all game logic in one file.",
+    "CLAUDE.md": "Guidance for Claude Code on the project's architecture and conventions."
+  }
+}
