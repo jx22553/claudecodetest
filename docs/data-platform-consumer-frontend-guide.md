@@ -1,4 +1,4 @@
-# The Consumer-Facing Front End — Knowledge Catalog and Access Portal
+# The Knowledge Catalog
 
 This document is the counterpart to the portal guide, for a completely different audience. The portal guide covers a producer watching their own deployment. This document covers a **consumer** — someone who doesn't own any data on this platform, wants to *use* someone else's, and has never touched `.dataplatform/` or opened a PR.
 
@@ -19,7 +19,7 @@ Everything up through "access approved" happens in **Google's own console**, not
 
 ---
 
-## Surface two: `access-portal` — ours, and it starts exactly where surface one ends
+## Surface two: `REST API Documentation`
 
 The approval email's link is where Google's UI hands off to something this platform built. `access-portal/frontend/` is a **separate deployable from `portal/`** — different repo directory, different audience, different purpose, and worth never conflating with the producer-facing portal covered in the other guide.
 

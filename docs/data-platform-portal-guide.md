@@ -1,4 +1,4 @@
-# The Portal — Frontend, Backend, and How It All Ties Together
+# The Observability Portal
 
 This document explains one piece of the platform in isolation: the portal. Everything else in the system exists to provision infrastructure; the portal's only job is to let a producer *see* what's happening to their data, from the moment they merge a PR through however long that pipeline keeps running afterward. It has no other job — there is no write path anywhere in it.
 
