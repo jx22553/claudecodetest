@@ -1,5 +1,9 @@
 # Why This Platform Exists
 
+The other documents in this set explain *how* the platform works. This one explains *why it exists at all*, and why it's built this exact way rather than any of the simpler alternatives that came up along the way. If you need to explain this project to someone who will never read a Terraform module, this is the document to hand them.
+
+---
+
 ## The problem, stated plainly
 
 Before this platform, making data available to another team looks like this: someone emails or Slacks a request, an engineer on the producing team hand-builds a one-off export, nobody documents the schema anywhere central, nobody knows who else is depending on it, and six months later someone changes a column name and breaks three things nobody remembered existed. Multiply that by every producer-consumer pair in an organization, and what you have isn't a data platform — it's tribal knowledge held together by Slack history.
