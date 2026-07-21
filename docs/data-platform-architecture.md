@@ -1,6 +1,6 @@
 # Data Platform Architecture
 
-A self-service data platform combining git-reviewed contracts, a thin control-plane API, GCP Workflows for orchestration, and Terraform as the sole creator of producer infrastructure — with a separate always-on hot path that publishes data without ever depending on the control plane at request time.
+A self-service data platform combining a UI-driven contract authoring portal, a platform-owned git monorepo as the single source of truth for all contracts, a thin control-plane API, GCP Workflows for orchestration, and Terraform as the sole creator of producer infrastructure — with a separate always-on hot path that publishes data without ever depending on the control plane at request time.
 
 Every numbered section below covers what the component is, how it works, and its concrete advantages — the chosen design, stated directly. Every place a real alternative was seriously weighed against that choice, the comparison lives in the **FAQ** at the end of this document, organized by the section it relates to, so the main narrative stays focused on how the platform actually works today.
 
@@ -8,9 +8,9 @@ Every numbered section below covers what the component is, how it works, and its
 
 | Tier | Priority | Components |
 |---|---|---|
-| **`T1`** | Build first — core data path | Dataflow ingestion job, Kafka topic, Managed connector (egress), Egress storage, Dataflow job provisioned |
-| **`T2`** | Build second — engineering automation | CLI, GitHub Actions, CI plan (provisioning-api + terraform-plan-job), CD apply (provisioning-api + saga.workflow + terraform-apply-job), Cloud Scheduler + reconcile, Firestore, Dataflow relay, New Kafka / Pub/Sub / GraphQL consumption patterns |
-| **`T3`** | Build last — observability and discovery | Confluent + Google providers (read-only), Knowledge Catalog, Portal (frontend + backend), Browse/request/approval flow, Direct access pattern |
+| **`T1`** | Build first — core data path | Dataflow ingestion job, REST publisher, Kafka topic, Managed connector (egress), Egress storage, Dataflow job provisioned |
+| **`T2`** | Build second — engineering automation | Portal (contract authoring + deployment status + metrics), GitHub Actions on platform contracts repo, CI plan (provisioning-api + terraform-plan-job), CD apply (provisioning-api + saga.workflow + terraform-apply-job), Cloud Scheduler + reconcile, Firestore (lineage store + schema cache), Dataflow relay, New Kafka / Pub/Sub / GraphQL consumption patterns, Federated producer route |
+| **`T3`** | Build last — power-user tooling and discovery | CLI (local validation only), Confluent + Google providers (read-only), Knowledge Catalog, Browse/request/approval flow, Direct access pattern |
 
 ---
 
@@ -20,9 +20,8 @@ Every numbered section below covers what the component is, how it works, and its
 data-platform/                          (platform monorepo)
 ├── cli/
 │   └── cmd/
-│       ├── init.go                      datapltfm init
-│       ├── update.go                    datapltfm update
-│       └── validate.go                  datapltfm validate
+│       └── validate.go                  datapltfm validate — local validation only,
+│                                        optional for engineers who prefer IDE feedback
 │
 ├── shared/
 │   ├── validation-lib/                  proto lint, schema compat, config schema
@@ -31,7 +30,7 @@ data-platform/                          (platform monorepo)
 │
 ├── provisioning-api/                    Cloud Run service (REST/JSON)
 │   └── routes/
-│       ├── ci.go                        dry-run plan, posts to PR
+│       ├── ci.go                        dry-run plan, posts status to portal
 │       ├── cd.go                        starts saga.workflow
 │       ├── jobs.go                      polled for status
 │       └── reconcile.go                 terraform plan diff, drift → compensation
@@ -52,6 +51,13 @@ data-platform/                          (platform monorepo)
 │   │                                    produce directly to Kafka
 │   └── template/                        Flex Template Dockerfile + spec
 │
+├── rest-publisher/                      Cloud Run service (Go) — alternative ingestion path
+│   ├── publish.go                       POST /v1/publish/{producer_route}
+│   ├── validate/                        dynamic protobuf validation (same logic as pipeline)
+│   ├── wireformat/                      Confluent envelope construction
+│   ├── cache/                           schema descriptor cache with Firestore listener
+│   └── produce/                         Kafka producer
+│
 ├── egress-fanout-pipeline/              Apache Beam (Java), Dataflow Flex Template
 │   ├── src/                             relay from egress storage into a
 │   │                                    consumer-specific topic/subscription
@@ -59,15 +65,21 @@ data-platform/                          (platform monorepo)
 │
 ├── portal/
 │   ├── frontend/                        React + TypeScript, Vite build → static bundle
-│   │   ├── src/pages/home-dashboard/    lists producers, search by id or name
-│   │   └── src/pages/deployment-status/ live status for one producer, reached via search
+│   │   ├── src/pages/home-dashboard/    producer's contracts list + status overview
+│   │   ├── src/pages/contract-create/   guided UI: schema fields, ingestion method,
+│   │   │                                egress target, SLA commitments
+│   │   ├── src/pages/contract-edit/     modify an existing contract (same form, pre-filled)
+│   │   └── src/pages/deployment-status/ live step-by-step view + lineage history + metrics
 │   └── backend/
-│       ├── status-api/                  reads Firestore, list/search, per-producer status
+│       ├── contract-api/                write path — validates, commits to data-contracts/,
+│       │                                opens PR via GitHub API, returns PR URL to frontend
+│       ├── status-api/                  reads Firestore lineage log, list/search, history
 │       └── metrics-client/              reads Confluent Cloud Metrics API
 │
 ├── infra/                               Terraform, platform's own resources
 │   ├── firestore.tf
-│   ├── secret-manager.tf                includes read-only Confluent metrics key
+│   ├── secret-manager.tf                includes read-only Confluent metrics key,
+│   │                                    GitHub App credentials for contract-api
 │   ├── iam.tf                           WIF pool/provider, per-service roles
 │   ├── cloud-run.tf
 │   ├── scheduler.tf
@@ -75,25 +87,36 @@ data-platform/                          (platform monorepo)
 │   └── modules/
 │       ├── producer-contract/           Confluent + Google providers, sink connectors,
 │       │                                pull subscription + Dataflow job per producer
+│       ├── federated-contract/          Knowledge Catalog entry only — no Kafka topic,
+│       │                                no Dataflow job; data stays in producer's project
 │       └── consumption-patterns/        applied on access-grant approval, not on merge
-│           ├── direct-access/           just an IAM grant, no new resource
+│           ├── direct-access/           IAM grant — GCP-native or cross-project
 │           ├── kafka-mirror/            connector where available, else egress-fanout-pipeline
 │           └── pubsub-subscription/     connector or new subscription, else egress-fanout-pipeline
 │
 └── .github/workflows/
-    ├── cli-release.yml
     ├── provisioning-api-deploy.yml
+    ├── rest-publisher-deploy.yml
     ├── orchestrator-deploy.yml
     ├── terraform-job-deploy.yml
     ├── pull-ingestion-pipeline-deploy.yml
     ├── portal-deploy.yml
     ├── infra-plan-apply.yml
-    ├── producer-ci.yml                  reusable, called by every producer repo
-    └── producer-cd.yml                   reusable, called by every producer repo
+    └── cli-release.yml                  optional; ships datapltfm validate binary
 
-<team>-data-contract/                   (many, separate repos)
-  .dataplatform/{schema,ingestion,egress,contract}/     contract.yaml holds SLA commitments, CONTRACT.md alongside it
-  .github/workflows/ci.yml, cd.yml       reference producer-ci.yml / producer-cd.yml
+data-contracts/                         (platform-owned monorepo, separate repo)
+  producers/
+  └── {producer_id}/
+      └── .dataplatform/
+          ├── schema/orders.proto         generated and committed by portal/contract-api
+          ├── ingestion/ingestion.yaml
+          ├── egress/egress.yaml
+          └── contract/
+              ├── contract.yaml
+              └── CONTRACT.md
+  .github/workflows/
+  ├── ci.yml                             triggers provisioning-api /ci on every PR
+  └── cd.yml                             triggers provisioning-api /cd on merge to main
 ```
 
 ---
@@ -102,14 +125,16 @@ data-platform/                          (platform monorepo)
 
 | Component | Language / framework | Why |
 |---|---|---|
-| `cli/` | Go + Cobra | Single static binary, no runtime dependency on arbitrary laptops. |
-| `provisioning-api/` | Go, plain `net/http` | Cold-start matters — this is scale-to-zero. Also keeps one language across the CLI and this service. See the FAQ for the general Go-vs-Spring-Boot reasoning behind every Cloud Run component here. |
+| `cli/` | Go + Cobra | `datapltfm validate` only — single static binary, no runtime dependency on arbitrary laptops. Optional; engineers who prefer local feedback before opening the portal can install it. |
+| `provisioning-api/` | Go, plain `net/http` | Cold-start matters — this is scale-to-zero. Also keeps one language across this service and the portal backend. See the FAQ for the general Go-vs-Spring-Boot reasoning behind every Cloud Run component here. |
+| `portal/backend/contract-api/` | Go | Same cold-start and language-consistency reasoning. Handles form submission, runs `shared/validation-lib`, generates contract files, commits to `data-contracts/` via GitHub API, opens PR. Thin orchestration layer — no business logic that isn't also in `shared/`. |
 | `terraform-job/` | Bash entrypoint + Terraform (HCL) | The job is "checkout, compile, run terraform" — a shell script calling three CLIs. No application logic here that would justify a general-purpose language. |
 | `pull-ingestion-pipeline/` | **Java**, Apache Beam | Dataflow's Java SDK is meaningfully more mature for streaming workloads — richer source connectors, stronger windowing/state support. The pipeline is also where all message-level validation, wire-format construction, and Kafka producing now live. |
+| `rest-publisher/` | Go, plain `net/http` | Same cold-start and language-consistency reasoning as `provisioning-api`. Shares the schema-descriptor cache pattern with `pull-ingestion-pipeline` but implemented in Go since this is a Cloud Run service, not a Dataflow pipeline. |
 | `egress-fanout-pipeline/` | **Java**, Apache Beam | Same reasoning as `pull-ingestion-pipeline` — genuinely the same technology, running in the opposite direction (out of egress storage, into a consumer-specific topic or subscription, instead of into the platform). |
-| `shared/validation-lib`, `shared/policy-bundles`, `shared/contract-compiler` | Go (lib/policy), Rego (policy rules) | Go so they compile directly into the CLI and `provisioning-api` as imports, not subprocess calls — see §8. |
+| `shared/validation-lib`, `shared/policy-bundles`, `shared/contract-compiler` | Go (lib/policy), Rego (policy rules) | Go so they compile directly into the CLI and portal backend as imports, not subprocess calls — see §8. |
 | `portal/frontend/` | React + TypeScript, built with Vite | A client-side SPA calling a REST API is the simplest thing that works for an internal, authenticated tool — no SEO requirement that would justify a server-rendering framework like Next.js. |
-| `portal/backend/` | Go | Thin service, mostly delegating to Firestore reads and the Confluent Metrics API. |
+| `portal/backend/` | Go | Thin service with three distinct jobs: contract authoring (write path), deployment status (read), and metrics (read). |
 | `orchestrator/` | GCP Workflows YAML | Not a general-purpose language by design. |
 | `infra/` | Terraform (HCL) | |
 
@@ -125,27 +150,36 @@ data-platform/                          (platform monorepo)
 
 ---
 
-## 2. CLI (`cli/`) — **`T2`**
+## 2. CLI (`cli/`) — **`T3`**
 
-**What it is:** `datapltfm init` / `datapltfm update` / `datapltfm validate` — scaffolds, refreshes, and locally validates `.dataplatform/` in a producer repo.
+**What it is:** `datapltfm validate` — a local validation tool for engineers who want schema lint, compatibility checks, and policy enforcement in their terminal or editor before touching the portal. It is no longer the primary entry point for creating or modifying data contracts; the portal is. The CLI ships as an optional convenience, not a required part of any producer's workflow.
 
-**Language and framework:** Go, using Cobra (the framework behind `kubectl`, `docker`, `gh`, and `helm`) for subcommands, flags, and shell completion.
+**Language and framework:** Go, using Cobra for subcommands and shell completion.
 
-**How it works:** `init` fetches the latest proto templates, config schemas, and CI/CD workflow templates from the platform's central registry and writes them into a new repo. `update` re-fetches later so a repo never drifts far from what the platform currently enforces. `validate` (`cli/cmd/validate.go`) runs `shared/validation-lib` and `shared/policy-bundles` against the working directory on demand, so a producer can re-check their contract after every edit, before ever committing. It statically links `validation-lib` as an imported Go package, so local lint behavior is byte-for-byte identical to what CI runs server-side.
+**How it works:** `validate` (`cli/cmd/validate.go`) runs `shared/validation-lib` and `shared/policy-bundles` against a local `.dataplatform/` directory. A producer can export their current contract files from the portal, run local validation, and re-submit via the portal — or skip the CLI entirely. It statically links `validation-lib` as an imported Go package, so local lint behavior is byte-for-byte identical to what `contract-api` runs server-side on submission.
+
+**What it no longer does:** `datapltfm init` and `datapltfm update` are retired. Contract scaffolding happens through the portal's guided form. There are no per-producer repos to scaffold into, and no CI/CD workflow files to install — all of that now lives in `data-contracts/` under the platform team's control.
 
 **Advantages:**
-- Compiles to a single static binary per OS/architecture — no runtime dependency, no version-matching issues on a developer's machine.
-- Same language as `provisioning-api` — one team, one set of idioms, one dependency-update cadence to track.
-- `shared/validation-lib` compiles into the CLI as a direct import, not a subprocess call — zero risk of the CLI's validation logic silently diverging from the server's.
-- Distributed via GitHub Releases (cross-compiled per OS/arch) or `go install` for Go-native users — no package registry to operate.
+- Compiles to a single static binary per OS/architecture — no runtime dependency, no version-matching issues.
+- `shared/validation-lib` compiles in as a direct import — zero risk of the CLI's validation logic diverging from what the portal runs on submission.
+- Distributed via GitHub Releases or `go install` — no package registry to operate.
 
 ---
 
 ## 3. GitHub Actions (`.github/workflows/`) — **`T2`**
 
-**What it is:** Platform deploy workflows (path-filtered, one per component) and reusable workflows (`producer-ci.yml`, `producer-cd.yml`) referenced by every producer repo.
+**What it is:** Two distinct sets of workflows, in two distinct repos.
 
-**Advantages:** A platform-team change to CI/CD behavior ships by editing one file; producer repos' own workflow files stay nearly static and need almost no maintenance, since all real logic lives server-side in `provisioning-api`.
+**In `data-platform/` (platform team's own repo):** path-filtered deploy workflows, one per component — `portal-deploy.yml`, `provisioning-api-deploy.yml`, etc. These run when the platform team ships a new version of any platform service. No producer ever touches these.
+
+**In `data-contracts/` (platform-owned contracts monorepo):** two workflows that drive the CI/CD lifecycle for every data contract in the system:
+- `ci.yml` — triggers on every PR to `data-contracts/`. Calls `provisioning-api`'s `/ci` route for the changed producer path(s), which runs validation and a plan-only Terraform run. Posts the plan result back to the PR as a status check — producers see this result in the portal's deployment status view, not in a GitHub PR they need to navigate to separately.
+- `cd.yml` — triggers on merge to main. Calls `provisioning-api`'s `/cd` route to start the saga.
+
+**What changed from the per-producer-repo model:** the reusable `producer-ci.yml` and `producer-cd.yml` workflows that producer repos previously referenced are gone. Every contract now lives in `data-contracts/`, and GitHub Actions in that one repo handle CI/CD for all of them. A platform-team change to CI/CD behavior is still a single-file edit — but now it's in `data-contracts/.github/workflows/` rather than the platform monorepo, and it applies to every contract simultaneously.
+
+**Advantages:** One repo, one set of CI/CD workflows, zero per-producer workflow maintenance; producers never see or manage a GitHub Actions file; the platform team owns the entire contract lifecycle end-to-end.
 
 ---
 
@@ -217,31 +251,54 @@ A CLI that reads `.dataplatform/{schema,ingestion,egress,contract}` at a given c
 
 ---
 
-## 9. Ingestion via Dataflow (`pull-ingestion-pipeline/`) — **`T1`**
+## 9. Ingestion — two paths to the same Kafka topic — **`T1`**
 
-**Every producer, without exception, is ingested the same way: they own a Kafka or Pub/Sub topic, and a per-producer Dataflow job pulls from it, validates each message, wraps it in the Confluent wire format, and produces directly to the internal Kafka topic.** There is no separate gateway service in this path — the pipeline owns the full journey from producer source to Kafka.
+**Every producer's data arrives in the internal Kafka topic through one of two paths: a Dataflow streaming pull job (the default for high-throughput producers who own a source topic) or the REST publisher (for producers who want synchronous HTTP delivery and immediate schema validation feedback).** Both paths converge on the same validate → Confluent wire format → Kafka produce sequence, and both use the same schema descriptor cache backed by Firestore (§11). The choice is declared in `ingestion.yaml` and determines what `terraform-apply-job` provisions at CD time.
 
-**Two prerequisites, stated explicitly, that a producer must satisfy before onboarding — the platform cannot create either on their behalf:**
+### 9a. Dataflow pull path (`pull-ingestion-pipeline/`) — **`T1`**
+
+**Two prerequisites, stated explicitly, that a producer must satisfy before onboarding on this path — the platform cannot create either on their behalf:**
 
 1. **A Kafka or Pub/Sub topic must already exist**, owned and operated by the producer. This is not something `terraform-apply-job` provisions — it's infrastructure the producer brings to the relationship.
 2. **The producer must grant the platform's designated service account read access to that topic** — a Pub/Sub IAM binding or a Kafka ACL, done on the producer's own side, before their PR can successfully apply. Terraform can create a subscription against an existing topic; it cannot reach into a producer's project or cluster and grant itself access it wasn't given.
 
 **How it works, end to end:**
 
-1. `ingestion/ingestion.yaml` declares a `source` — `type: kafka_topic` or `type: pubsub_topic`, plus connection details and a Secret Manager credential reference (never a literal value).
-2. At CD apply time, `terraform-apply-job` provisions, for every producer without exception: a pull subscription (Pub/Sub) or consumer group (Kafka) against the producer's existing topic, and a Dataflow job from the same generic, parameterized Beam pipeline template — one template serving every producer through runtime parameters.
+1. `ingestion/ingestion.yaml` declares `method: pull` and a `source` — `type: kafka_topic` or `type: pubsub_topic`, plus connection details and a Secret Manager credential reference (never a literal value).
+2. At CD apply time, `terraform-apply-job` provisions a pull subscription (Pub/Sub) or consumer group (Kafka) against the producer's existing topic, and a Dataflow job from the same generic, parameterized Beam pipeline template — one template serving every producer through runtime parameters.
 3. That Dataflow job holds one persistent streaming-pull connection to the producer's topic. The job opens the connection once and the source hands it new messages continuously as they arrive, with no per-message reconnect.
-4. For each message, the pipeline validates the payload via dynamic protobuf reflection against a descriptor fetched from Firestore at startup and refreshed via a background listener — no per-message Firestore call. Invalid messages are routed to a dead-letter topic rather than dropped silently.
-5. Validated messages are wrapped in the Confluent wire format (schema ID header + serialized protobuf bytes) using the schema ID written to Firestore by the saga at deploy time.
-6. The pipeline produces directly to the internal Kafka topic using a Confluent Kafka producer configured with the cluster credentials from Secret Manager.
+4. For each message, the pipeline validates the payload via dynamic protobuf reflection against the descriptor held in its in-process cache (populated at startup from Firestore, kept current by a background listener — see §11). Invalid messages are routed to a dead-letter topic rather than dropped silently.
+5. Validated messages are wrapped in the Confluent wire format (schema ID header + serialized protobuf bytes) and produced directly to the internal Kafka topic using a Confluent Kafka producer configured with the cluster credentials from Secret Manager.
 
 **IAM:** the Dataflow job's service account holds Kafka produce credentials (from Secret Manager) and Firestore read access. No producer-side identity ever touches the internal Kafka cluster.
 
 **A deliberate carve-out:** teardown uses Dataflow's `on_delete = "drain"` rather than cancel, so in-flight pulled data finishes processing rather than being dropped mid-record.
 
-**The one honest cost of this design:** schema validation is asynchronous from the producer's perspective. A producer publishing to their own topic gets no immediate feedback if their payload doesn't match the schema — the dead-letter topic surfaces the failure, but not synchronously. This is a real, uncovered gap and a candidate for future work if it proves painful in practice.
+**The one honest cost of this path:** schema validation is asynchronous from the producer's perspective. A producer publishing to their own topic gets no immediate feedback if their payload doesn't match the schema — the dead-letter topic surfaces the failure, but not synchronously. Producers who need synchronous validation feedback should use the REST publisher path instead.
 
-**Advantages:** Zero producer-side integration code, for any producer, of any sophistication level; one pipeline template scales to every producer through parameters; no separate service to deploy, scale, or operate on the hot path; Confluent Kafka credentials stay inside the platform's own Dataflow service account, never exposed to producer-side identities.
+**Advantages:** Zero producer-side integration code; one pipeline template scales to every producer through parameters; no separate service to deploy, scale, or operate on the hot path; Confluent Kafka credentials stay inside the platform's own Dataflow service account, never exposed to producer-side identities.
+
+---
+
+### 9b. REST publisher (`rest-publisher/` — Cloud Run service, Go) — **`T1`**
+
+**What it is:** A Cloud Run service that accepts authenticated HTTP POST requests carrying a single event payload and returns a synchronous confirmation — or a synchronous schema validation error. It is an alternative ingestion path for producers who already have HTTP client infrastructure, want immediate schema feedback, or are publishing at rates where a persistent streaming-pull connection is unnecessary overhead.
+
+**When to use this path vs. the Dataflow path:** the Dataflow pull path is the better fit for sustained high-throughput producers (sub-millisecond message intervals) because it amortizes connection cost across continuous delivery. The REST publisher is the better fit for lower-frequency producers, event-driven publishers, or any producer where the synchronous reject-on-bad-schema behavior is operationally valuable. Both paths are available to every producer — the choice is a single field in `ingestion.yaml`.
+
+**How it works:**
+
+1. `ingestion/ingestion.yaml` declares `method: rest`. At CD apply time, `terraform-apply-job` grants the producer's declared service account `roles/run.invoker` on the `rest-publisher` Cloud Run service — no Dataflow job is provisioned for this producer.
+2. The producer's application sends `POST /v1/publish/{producer_route}` with an `Authorization: Bearer` token and a protobuf or JSON body. The platform-issued token is exchanged via Workload Identity; no API key is distributed.
+3. `rest-publisher` resolves the `producer_route` to a cached schema descriptor (same Firestore listener mechanism as the Dataflow pipeline — loaded at instance startup, updated in the background, never fetched per request).
+4. The payload is validated via dynamic protobuf reflection against that descriptor. If validation fails, the service returns a `400` with a structured error describing the field-level mismatch — synchronously, before anything reaches Kafka.
+5. A valid payload is wrapped in the Confluent wire format and produced to the internal Kafka topic. The service returns `200` with the assigned Kafka offset once the broker acknowledges.
+
+**Schema validation is synchronous here** — the key behavioral difference from the Dataflow path. A producer gets an immediate, actionable error if their payload doesn't match the declared schema, rather than discovering it later via the dead-letter topic.
+
+**IAM:** `roles/run.invoker` is granted only to the specific service account the producer declared in their `ingestion.yaml`. The service itself holds Kafka produce credentials via Secret Manager — no producer-side identity ever sees them.
+
+**Advantages:** Synchronous schema validation feedback; no prerequisite source topic for the producer to manage; natural fit for HTTP-native publishers; shares the same descriptor cache and Confluent wire-format logic as the Dataflow path, so there is no behavioral divergence between the two paths once a message is accepted.
 
 ---
 
@@ -265,36 +322,77 @@ Where no managed connector exists for a given target (possibly AlloyDB or Firest
 
 ## 11. Firestore — **`T2`**
 
-**How it works:** Holds deployment/saga-log records and a mirror of CSR (`subject → schema_id → descriptor`), written by the saga once Terraform apply succeeds. The `pull-ingestion-pipeline` fetches this descriptor at Dataflow job startup and refreshes it via a background listener, giving it the schema information it needs for validation and wire-format construction with no per-message external call.
+**How it works — two distinct document collections, one database:**
 
-**Advantages:** Background listener keeps the pipeline's schema view current without polling; serverless, no capacity planning for what is genuinely low, bursty write volume.
+**Deployment lineage log (`deployments/{producer_id}/events/{event_id}`):** every saga checkpoint is appended as a new document — never overwritten. A deploy start, each provisioning step, a success, a compensation trigger, a revert — each is a separate timestamped document. The current state of a producer's deployment is always the latest event in their subcollection; full history is always queryable without any custom versioning scheme. The portal's `status-api` reads this subcollection to render both the live step-by-step view during an active deployment and the full deployment history a producer can scroll back through.
+
+**Schema descriptor mirror (`schemas/{producer_id}/versions/{schema_id}`):** every schema version that CSR assigns is written as a separate document at the same saga checkpoint. The `pull-ingestion-pipeline` and `rest-publisher` both load the latest descriptor at startup from this collection and keep it current via a Firestore realtime listener — no per-message Firestore read, no polling interval. When a producer ships a new schema version, the saga writes it here, and the listener pushes the update to every running pipeline and publisher instance within seconds, without a redeploy.
+
+**Why the hot path never reads Firestore per message:** both the Dataflow pipeline and the REST publisher maintain an in-process schema descriptor cache, populated at startup and updated by the background listener. A message arriving on the hot path finds the descriptor already in memory — the Firestore read already happened, asynchronously, when the schema was first deployed or last updated. This gives the hot path zero external calls per message while staying current within the listener's propagation window (typically under 5 seconds).
+
+**Advantages:** append-only deployment events give full lineage with no custom versioning code — the entire history is always there, including every compensation and revert; the background listener pattern removes Firestore from the per-message hot path entirely; serverless, no capacity planning for what is genuinely low, bursty write volume.
 
 ---
 
-## 12. Data Producer Observability Portal — **`T3`**
+## 12. Data Producer Portal — **`T2`**
 
-**What it is:** A fully read-only status and monitoring UI, entered through a home dashboard rather than a deep link — not a second control plane. This is producer-facing only — it serves the team that owns a data contract, watching their own deployment. Its only job is to let a producer see what's happening to their data, from the moment they merge a PR through however long that pipeline keeps running afterward. There is no write path anywhere in it.
+**What it is:** The primary interface for data producers — a single destination for creating and modifying data contracts, watching deployments happen live, and confirming that data is actually flowing. It now has a write path: the portal is where contracts are born and updated, not a downstream observer of work done elsewhere. Every producer, regardless of git experience, has a complete self-service on-ramp through this UI.
 
-**How it works:**
+**The portal has three distinct surfaces, accessible from the same authenticated home dashboard:**
 
-`portal/frontend` is a React + TypeScript SPA, built with Vite into static files served from Cloud Storage + CDN. "Static" describes how the app shell is delivered, not whether the page shows live data. The browser downloads the same unchanging files from the CDN, then the JavaScript makes its own live HTTP calls to `portal/backend` to fetch real, current data on a timer — the "dashboard that updates every few seconds" feeling comes entirely from that client-side polling, not from anything the server did differently per request.
+---
 
-The page a producer actually bookmarks is the **home dashboard** (`/`) — a list of producer data contracts with a search box matching on either `producer_id` or a human-readable name. The saga records a readable name alongside the ID the first time it writes a deployment record specifically so this search works. Selecting a result navigates client-side (no page reload, no new file fetched from the CDN) to that producer's live status view.
+### Contract authoring (write path)
 
-**`portal/backend`** is one Cloud Run service with two distinct read-only jobs:
+A guided multi-step form where a producer defines their data contract without touching a file or a terminal. The form covers every field that previously lived in `.dataplatform/`:
 
-- **`status-api/`** reads Firestore's deployment records and saga checkpoints, and exposes the list/search endpoint powering the home dashboard — matching on `producer_id` or the recorded name. This is what renders each saga step live while a deployment is in progress.
-- **`metrics-client/`** queries Confluent Cloud's own Metrics API — topic-level produce rate, last-message timestamp — using a separate, read-only scoped API key. A successful deployment only proves resources exist, not that data is moving. `metrics-client` is the only place in the entire system that answers "is this actually working, right now," and it gets that answer without touching the pipeline's hot path at all.
+- **Schema definition** — a form-based protobuf message builder: add fields, set types, mark optional/required. Produces a valid `.proto` file; the producer never writes protobuf syntax directly.
+- **Ingestion configuration** — choose Dataflow pull (with source topic details and credential reference) or REST publisher; federated producers declare their existing GCP resource here instead.
+- **Egress target** — pick a storage target from a dropdown; the form adapts to show only the relevant config fields for that target (BigQuery shows dataset/table/partition, Bigtable shows instance/table/row-key design, etc.).
+- **SLA commitments** — structured fields for `freshness_sla_minutes`, `uptime_commitment_pct`, `breaking_change_notice_days`, `support_contact`, and an optional free-text `CONTRACT.md` editor.
 
-**Polling rhythm:** while a deployment is actively running, the frontend polls every 2–3 seconds, rendering each saga step as it completes (this works because `saga.workflow` already checkpoints to Firestore at every meaningful step). Once deployment reaches a terminal state, polling slows to every 30–60 seconds for ongoing health checks. The page keeps working indefinitely as a health view — a producer returns any time by going back to the home dashboard and searching again, not by remembering a URL.
+On submission, `portal/backend/contract-api/` does the following in sequence:
 
-**The status view also links out to that producer's Data Product page in Knowledge Catalog** (§13) — one click from operational status straight to the governed catalog entry a consumer would find when browsing.
+1. Runs `shared/validation-lib` and `shared/policy-bundles` on the generated contract — the same validation that CI runs, before anything reaches git. Returns field-level errors immediately if validation fails, so the producer fixes them in the form before a commit is ever made.
+2. Generates the canonical contract files (`schema/orders.proto`, `ingestion/ingestion.yaml`, `egress/egress.yaml`, `contract/contract.yaml`, `contract/CONTRACT.md`) via `shared/contract-compiler`.
+3. Commits those files to `data-contracts/producers/{producer_id}/.dataplatform/` via the GitHub API, using a platform-managed GitHub App credential stored in Secret Manager.
+4. Opens a pull request against `data-contracts/` main branch and returns the PR details to the frontend.
+5. Writes a pending deployment event to Firestore so the portal's deployment status view immediately reflects the in-progress state.
 
-**Auth:** portal access goes through the org's existing SSO. Both `status-api` and `metrics-client` check the authenticated user's identity against which `producer_id`s their team owns before returning anything — including through the dashboard's search, which only ever returns results the requester is allowed to see.
+**For contract modifications:** the portal's edit page pre-fills the same form with the current values read from Firestore (the latest deployed contract state). Submitting an edit goes through the identical sequence above — validation, file generation, commit, PR. The producer sees a diff summary of what changed before confirming the submission.
 
-**What the portal deliberately does not do:** it never triggers a Terraform apply, calls `provisioning-api`'s `/cd` route, or starts a GCP Workflows execution. It never writes to Firestore. It has no integration with GitHub, no wizard, and no PR creation. If a producer wants to change their contract, they go back to git — the portal doesn't offer a shortcut. This is what keeps the portal from ever becoming a second, competing system of record. The honest cost: a producer with no git experience has no on-ramp through this tool.
+**PR review and the platform team's role:** the PR that `contract-api` opens is reviewable by the platform team (or auto-approved based on configurable policy — e.g., schema-compatible changes with no egress target change merge automatically; breaking changes or new federated source declarations require a human review). This is where the platform team retains governance over what enters the contracts monorepo, without requiring producers to understand git.
 
-**Advantages:** Exactly one system of record — the portal genuinely cannot cause drift, since it cannot write anything; a real, continuously-checkable answer to "is my data actually flowing," not just a deployment receipt; an entry point that matches how people actually navigate back to a tool they used once weeks ago; one click from operational status straight to the governed catalog entry.
+---
+
+### Deployment status and history (read path)
+
+The same deployment monitoring that existed before, now directly connected to the contract the producer just submitted:
+
+- **Live step-by-step saga view** — polls `portal/backend/status-api/` every 2–3 seconds while a deployment is active, rendering each saga checkpoint as it completes. The plan result from CI is shown here before the PR merges, so the producer sees what will change before it does.
+- **Full deployment history** — reads the append-only Firestore lineage log for this producer, showing every prior deployment, compensation, and revert with timestamps and outcomes. A producer can see the complete history of their contract without leaving the portal.
+- **Live metrics** — once deployed, `portal/backend/metrics-client/` queries Confluent Cloud's Metrics API for produce rate and last-message timestamp. Deployment success proves infrastructure exists; this proves data is moving.
+- **Link to Knowledge Catalog** — one click from the deployment status view to the producer's Data Product page in Knowledge Catalog, so they can confirm what a consumer will see.
+
+---
+
+### Home dashboard
+
+The page producers bookmark. Shows every contract they own (scoped to their SSO identity), with a status badge (deploying / deployed / failed / compensation-in-progress) and last-active metrics for each. Search matches on `producer_id` or human-readable name. Selecting a contract navigates to its deployment status view. A "New contract" button opens the authoring form.
+
+---
+
+**`portal/backend`** is one Cloud Run service with three distinct jobs:
+
+- **`contract-api/`** — the write path. Validates submitted forms, generates contract files, commits to `data-contracts/` via GitHub API, returns PR details and initial status. This is the only component in the entire system that writes to `data-contracts/` on a producer's behalf.
+- **`status-api/`** — reads Firestore's deployment lineage log; powers the live step view, history, and home dashboard status badges.
+- **`metrics-client/`** — queries Confluent Cloud's Metrics API using a read-only scoped key.
+
+**Auth:** portal access goes through the org's existing SSO. All three backend jobs scope their responses to what the authenticated user's team owns — including the home dashboard search, which only ever returns contracts the requester is allowed to see. `contract-api` additionally verifies that the submitting user is authorized to create or modify a contract for the declared `producer_id`.
+
+**`portal/frontend`** is a React + TypeScript SPA, built with Vite into static files served from Cloud Storage + CDN. "Static" describes how the app shell is delivered — the JavaScript running in the browser makes live calls to `portal/backend` for all data and all mutations.
+
+**Advantages:** every producer, regardless of git experience, has a complete self-service on-ramp; all contracts are platform-governed from creation, not just from the first CI run; the platform team retains PR-level review without requiring producers to learn git; one system of record (`data-contracts/`) for all contracts, owned and auditable by the platform team; the authoring and monitoring experience are the same tool, so producers naturally check deployment status and metrics as part of creating a contract rather than hunting for a separate URL.
 
 ---
 
@@ -351,6 +449,53 @@ Everything a consumer does, from discovery through gaining access, happens in Go
 
 ---
 
+## 15. Federated producer route — data stays in the producer's GCP project — **`T2`**
+
+**What it is:** A contract path for producers who already have data stored in their own GCP project — a BigQuery dataset, a Cloud SQL instance, a Spanner database, a Cloud Storage bucket — and don't need (or want) the platform to ingest a copy into the internal Kafka topic. Instead of provisioning an ingestion pipeline, the platform registers a semantic model of that data in Knowledge Catalog, so consumers can discover it, understand it, and request access to it through the same catalog experience as any other data product. The data never moves. The platform brokers access to where it already lives.
+
+**When to use this path:** a producer who manages a well-maintained BigQuery dataset that consumers should be able to query directly; a team with an existing Cloud SQL database that's already the authoritative source and copying it would create a stale, secondary replica; any case where the primary need is governed discoverability and controlled access, not a streaming pipeline.
+
+**How it works — contract declaration:**
+
+`ingestion/ingestion.yaml` declares `method: federated`, with a reference to the producer's existing GCP resource:
+
+```yaml
+method: federated
+source:
+  type: bigquery_dataset        # or cloud_sql, spanner_database, cloud_storage_bucket
+  project: orders-team-prod
+  dataset: orders_analytics     # bigquery_dataset only
+```
+
+No `source.topic_name`, no `credentials` field — the platform doesn't pull from this resource. What it does instead is described below.
+
+**How it works — what the saga provisions:**
+
+At CD apply time, `terraform-apply-job` runs the `infra/modules/federated-contract/` module instead of `producer-contract/`. This module does four things and only four things:
+
+1. **Registers a Knowledge Catalog Entry** pointing at the producer's external resource — the same custom Entry shape and `DataContract` Aspect as a standard ingestion producer, so consumers see no difference in the catalog experience.
+2. **Attaches schema metadata** compiled from `schema/orders.proto` (or a BigQuery schema export, if the producer declares `schema_source: bigquery` instead of a `.proto` file) as a Schema Aspect on the Entry.
+3. **Writes a Firestore document** recording the federated source reference — used at access-grant time to know which project and resource to target when provisioning consumer access.
+4. **Does not** create a Kafka topic, a Confluent schema registration, a Dataflow job, a pull subscription, or a managed connector. None of those exist for a federated producer.
+
+**How it works — consumer access provisioning:**
+
+When a consumer requests access via Knowledge Catalog and is approved, provisioning depends on which access pattern they chose:
+
+- **Direct access** — `terraform-apply-job` applies a cross-project IAM binding in the producer's own GCP project: for example, `roles/bigquery.dataViewer` on the specific dataset, granted to the consumer's service account. The consumer queries BigQuery directly in the producer's project, using their own credentials. The platform provisions the binding and writes it back to Knowledge Catalog; it never touches the data itself.
+- **New Kafka topic** — the platform provisions an `egress-fanout-pipeline` Dataflow job that reads from the federated source (BigQuery export, Cloud SQL CDC, etc.) and writes into a new platform-managed Kafka topic scoped to this consumer. The consumer reads from that topic with a standard Kafka client. The data is copied at this point — but only per consumer grant, not speculatively.
+- **New Pub/Sub subscription** — same as above, but the fanout destination is a Pub/Sub topic rather than Kafka.
+
+**What "cross-project IAM" actually requires:** the platform's `terraform-apply-job` service account must be granted `roles/resourcemanager.projectIamAdmin` (or a tighter custom role covering just the resource type being bound) in the producer's project. This is a one-time, per-producer-project prerequisite — documented in the contract onboarding checklist — analogous to the IAM binding a Dataflow-path producer grants for topic read access. Without it, the apply job cannot provision consumer grants into an external project.
+
+**Schema source flexibility:** producers on the federated path can declare their schema as either a `.proto` file (same as standard ingestion, compiled by `contract-compiler`) or as `schema_source: bigquery`, which causes `contract-compiler` to call the BigQuery API at plan time and generate a proto-compatible representation of the live table schema automatically. This means a producer with an existing BigQuery table doesn't need to re-author their schema in protobuf — they get a catalog entry that reflects their actual columns.
+
+**Advantages:** Governed discoverability for data that's already well-managed without requiring the producer to change how they store or publish it; cross-project IAM access provisioned the same way as everything else — through Terraform, through the same `terraform-apply-job`, torn down on revocation; consumers get the same Knowledge Catalog browse-and-request experience regardless of whether the data is on the platform's own Kafka topic or in an external GCP project.
+
+**The honest constraints:** the platform cannot enforce schema validation for data written directly to an external BigQuery table — it can only describe what's there. If a producer's BigQuery schema drifts from the declared contract, the catalog entry becomes stale until the producer updates their PR. And cross-project IAM provisioning requires that initial `projectIamAdmin` grant in the producer's project, which some organizations' security posture may require a separate approval track for.
+
+---
+
 ## FAQ
 
 ### 1. Should this Cloud Run service be Go, or something like Spring Boot?
@@ -361,20 +506,27 @@ This comes up for any of the Cloud Run services and jobs in this platform, not j
 - **Fleet consistency.** Every Cloud Run component in this platform is Go. One language means one team, one dependency-update cadence, and an engineer can move between services without a context switch.
 - **When Spring Boot would actually be the better call:** if the team's core strength were Java rather than Go, or if a given service were expected to grow a much heavier surface — complex auth integrations, ORM-heavy data access, dozens of endpoints — Spring's ecosystem maturity would start to outweigh Go's cold-start edge. Given the actual shape of these services today (thin routes that mostly delegate work to Terraform, Workflows, or Firestore), that ecosystem weight isn't buying much here. This is a right-tool-for-the-current-shape call, not a claim that Go is categorically better.
 
-### 2. Why does the CLI use git and a PR flow instead of a direct front-end portal? (§2)
+### 2. Why a platform-owned contracts monorepo instead of per-producer repos with a CLI? (§2, §3, §12)
 
-Instead of the CLI scaffolding a `.dataplatform/` folder reviewed via a PR, producers could instead log into a web portal, fill out a form (topic name, schema fields, ingestion method, storage target), and submit — with the backend provisioning directly from that submission. This is a materially different design, not just a different UI skin on the same flow, because it removes git as the source of truth entirely. It lost, for these reasons:
+The original design used a CLI (`datapltfm init`) to scaffold contract files into each producer team's own repo, with reusable CI/CD workflows the producer repo referenced. That design was replaced for three distinct reasons:
 
-| What git + CLI gives you for free | What a form-and-submit portal would have to build from scratch |
+**First, producer accessibility.** Git and PR workflows are familiar to platform engineers but are a real barrier for data producers who aren't engineers — analysts, data stewards, domain owners who know their data but don't own a GitHub repo. A form in a browser is the right interface for declaring "my table has these columns, freshness SLA is 15 minutes, storage target is BigQuery." Forcing that through a `.proto` file and a git push wasn't serving them.
+
+**Second, governance and consistency.** With contracts scattered across dozens of producer repos, each team controls their own CI/CD workflow file — meaning they could accidentally break or bypass it, reference a stale version of the platform's reusable workflow, or drift from whatever policy the platform team intended to enforce. In the platform-owned monorepo, there is exactly one CI/CD workflow for all contracts, owned by the platform team, updated once and applied everywhere. No producer can accidentally opt out of a policy check.
+
+**Third, auditability.** "Which contracts exist, and what do they currently declare?" is answerable from a single repo rather than requiring a sweep across every producer team's codebase. The full git history of every contract change — who submitted it, when, what was reviewed — lives in one place under the platform team's control.
+
+**What the per-producer-repo design gave for free, and how the new design matches it:**
+
+| What the old design provided | How the new design provides the same |
 |---|---|
-| Full version history — who changed what, when, and why (commit message) | A bespoke audit-log and versioning system, since a database row has no history unless you build one |
-| Code review via pull requests — CODEOWNERS routing, required approvals, inline comments on the exact lines that changed | An equivalent approval workflow reimplemented in application code — who can approve, how reviewers see the diff, how "submit" is blocked pending approval |
-| Diffable, greppable schemas — `git blame`, `git log -p`, org-wide code search across every producer's contract | Custom UI to approximate "what changed since last time," and no way to search across contracts with existing tooling |
-| Rollback via `git revert` — the entire compensation-and-revert mechanism (§6) depends on git being the source of truth | A hand-built "previous version" concept and revert mechanism — essentially reinventing git's version model inside application state |
-| CI/CD as the natural "propose, review, then apply" pattern — this is just how git-triggered pipelines already work | Custom logic to recreate the same safety separation, since a form submission has no natural "pull request" analog |
-| Producers edit `.proto` files in their own IDE, with language-server support, and can test schema changes locally before touching the platform | A web form for authoring arbitrary protobuf — painful UX for anything beyond flat messages, or a dumbed-down subset of what producers can actually express |
+| Full version history per contract | `data-contracts/` git history per `producers/{producer_id}/` path |
+| PR review before apply | `contract-api` opens a PR; platform team reviews (or auto-approves per policy) |
+| Rollback via `git revert` | Compensation workflow targets the previous commit in `data-contracts/` exactly as before |
+| Validation before commit | `contract-api` runs `shared/validation-lib` before writing a single file to git |
+| CI/CD separation (propose then apply) | `data-contracts/` CI workflow calls `/ci` on PR; `/cd` on merge — structurally identical |
 
-**The honest gap this leaves:** non-technical users genuinely find a form friendlier than learning git and PRs — and this platform doesn't currently solve that. The portal (§12) is purely observational, with no write path at all; a producer with no git/PR experience has no on-ramp today. That's a deliberate scoping decision, not an oversight — a future non-technical on-ramp, if built, deserves its own dedicated design rather than being bolted onto a monitoring dashboard.
+The CLI (`datapltfm validate`) still exists for engineers who want a local feedback loop — but it's optional, not required, and has no `init` or `update` commands because there's nothing to scaffold into a producer repo anymore.
 
 ### 3. Why keep `provisioning-api` instead of having GitHub Actions call GCP Workflows or Cloud Scheduler directly? (§4)
 
@@ -445,16 +597,20 @@ Self-hosted Kafka + Schema Registry was ruled out quickly, for operational cost 
 | Option | Why it lost |
 |---|---|
 | Bigtable | Built for a different scale/shape of problem (millions of QPS, wide-column) than low-volume platform metadata; its Change Streams don't offer the same simple SDK-level background listener the pipeline's schema cache depends on. |
-| Cloud SQL / Postgres | Relational would model deployment records fine, but lacks a native push/listener mechanism, for data whose shape (varying config per producer, per egress type) fits documents more naturally than a fixed schema anyway. |
+| Cloud SQL / Postgres | Relational would model deployment records fine, but lacks a native push/listener mechanism — which is load-bearing for the hot-path cache design — and the append-only event log shape fits documents more naturally than a fixed relational schema anyway. |
 
 ### 10. Why build on Knowledge Catalog instead of a custom catalog, or treating Firestore as the catalog? (§13)
 
 | Option | Why it lost |
 |---|---|
 | Build a custom catalog and access-request workflow from scratch | Would mean re-implementing search, lineage graphing, approval routing, and a governance UI — all of which Knowledge Catalog already provides natively. |
-| Treat Firestore as the catalog | Firestore has no search, no lineage graph, no org-wide discovery UI, and no consumer-facing browse/request experience. It's the right tool for real-time operational state, the wrong tool for organization-wide discovery. |
+| Treat Firestore as the catalog | Firestore has no search, no lineage graph, no org-wide discovery UI, and no consumer-facing browse/request experience. It's the right tool for real-time operational state and append-only deployment logs; the wrong tool for organization-wide discovery. |
 
-### 11. Why prefer a managed connector over Dataflow for consumer fan-out, wherever one exists? (§14)
+### 11. Why offer a REST publisher at all, when the Dataflow pull path already works? (§9b)
+
+The Dataflow pull path has one structural limitation that's genuinely painful for some producers: schema validation is asynchronous. A message that doesn't match the declared schema surfaces in the dead-letter topic, not as an immediate error to the publisher. For producers building event-driven systems, or teams onboarding who want rapid feedback during development, that gap is real. The REST publisher closes it — a bad payload gets a `400` back before it ever touches Kafka. The two paths converge on identical behavior once a message is accepted, so there's no risk of behavioral divergence downstream.
+
+### 12. Why prefer a managed connector over Dataflow for consumer fan-out, wherever one exists? (§14)
 
 Less custom code to operate, and Confluent already handles connector-level scaling and retry. Dataflow remains necessary both for the combinations no connector covers, and structurally — a producer's own sink (§10) is fixed and always-on, while a consumer-requested relay needs an arbitrary source relaying into a destination created and destroyed per individual grant, a shape existing connectors aren't built for regardless of which storage type is involved.
 
@@ -464,12 +620,16 @@ Less custom code to operate, and Confluent already handles connector-level scali
 
 | Principle | Where it shows up |
 |---|---|
-| One system of record | Git is the only place provisioning is *declared*; the portal never writes; Terraform state is the only place "what exists" is recorded |
+| One system of record | `data-contracts/` is the only place contracts are *declared*; `contract-api` is the only writer to it; Terraform state is the only place "what exists" is recorded |
 | Control plane vs. hot path, strictly separated | Workflows/Terraform never appear on the publish path; Firestore is the only bridge |
 | Revert is symmetric with create | Compensation is "apply the previous commit's generated vars," not bespoke undo code per resource |
-| Least privilege by construction | Confluent Kafka credentials live only in the Dataflow service account; per-producer Terraform state prevents cross-producer blast radius |
-| Fail fast, cheaply | `/ci` and validation reject bad input before any real execution starts |
+| Least privilege by construction | Confluent Kafka credentials live only in the Dataflow/REST publisher service accounts; per-producer Terraform state prevents cross-producer blast radius; cross-project IAM grants are scoped to the specific resource, not the whole project |
+| Fail fast, cheaply | `contract-api` runs full validation before committing a single file; `/ci` and the plan job reject bad input before any infrastructure is touched; the REST publisher rejects schema mismatches synchronously before anything reaches Kafka |
 | Safety nets have their own safety nets | Saga compensation catches in-flight failures; `terraform plan`-based reconciliation catches everything the saga couldn't see happen |
-| One generic mechanism, not one per producer | The pipeline's single Beam template serves every producer through runtime parameters, never a compiled-in, producer-specific path |
-| Not everything needs to go through git | Schema and infrastructure changes do, deliberately. Access grants deliberately don't — the right check for "should this consumer see this data" is a business decision made fast by an owner, not an engineering review of a diff |
+| One generic mechanism, not one per producer | The Dataflow pipeline's single Beam template and the REST publisher's single route both serve every producer through runtime parameters, never a compiled-in, producer-specific path |
+| Hot path reads nothing per message | Both ingestion paths (Dataflow and REST publisher) carry schema descriptors in an in-process cache backed by a Firestore listener — zero external calls at message time |
+| Full lineage, never overwritten | Firestore deployment records are append-only events — the complete history of every deploy, compensation, and revert is always queryable without a custom versioning scheme |
+| Data gravity respected | The federated producer route lets well-managed existing data stay where it is; the platform adds discoverability and access control without forcing a copy |
+| Platform-governed, producer-accessible | All contracts live in a platform-owned monorepo the platform team controls end-to-end; producers interact through a form UI, not git — without sacrificing review, audit trail, or rollback |
+| Not everything needs to go through git | Access grants deliberately don't — the right check for "should this consumer see this data" is a business decision made fast by an owner, not an engineering review of a diff |
 | Be honest about a dependency's own limits | Firestore is genuinely real-time; Knowledge Catalog is not, and that's stated plainly rather than implied to be seamless |
